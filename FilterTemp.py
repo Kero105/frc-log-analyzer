@@ -2,8 +2,19 @@
 # Reads a .wpilog file from the roboRIO and reports motor temperatures,
 # voltages, currents, radio status, and brownouts.
 #
-# Run: python FilterTemp.py   then drag your .wpilog file into the terminal.
+# Interactive mode (menus):
+#   python FilterTemp.py                 then drag your .wpilog file in
+#   python FilterTemp.py match.wpilog
+#
+# Command-line mode (no menus):
+#   python FilterTemp.py match.wpilog --brownouts
+#   python FilterTemp.py match.wpilog --max --filter /Robot/SuperSystem
+#   python FilterTemp.py match.wpilog --csv match_data.csv
+#
+# On Windows you can also drag a .wpilog file onto Temp.bat.
 
+import argparse
+import csv
 import sys
 
 from datalog import DataLogReader
@@ -284,6 +295,31 @@ def print_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS):
     print(f"  Total: {len(events)} brownout event(s)")
 
 
+# ---------- CSV export ----------
+
+def export_csv(log, filters, csv_path):
+    """Write every temperature, voltage, and current reading to a CSV file."""
+    rows = 0
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp_s", "entry", "kind", "value"])
+        for name, readings in sorted(log.series.items()):
+            if is_skipped(name) or (filters and not any(x in name for x in filters)):
+                continue
+            if is_temp(name):
+                kind = "temp_c"
+            elif is_current(name):
+                kind = "current_a"
+            elif is_voltage(name):
+                kind = "voltage_v"
+            else:
+                continue
+            for timestamp_s, value in readings:
+                writer.writerow([f"{timestamp_s:.6f}", name, kind, value])
+                rows += 1
+    print(f"Wrote {rows} readings to {csv_path}")
+
+
 # ---------- Interactive menus ----------
 
 def interactive(log):
@@ -353,12 +389,44 @@ def interactive(log):
 
 # ---------- Entry point ----------
 
-if __name__ == "__main__":
-    log_path = input("Drag your .wpilog file here and press Enter: ")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Analyze an FRC .wpilog file.")
+    parser.add_argument("log", nargs="?", help="path to the .wpilog file")
+    parser.add_argument("--brownouts", action="store_true", help="report brownout events")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_BROWNOUT_VOLTS,
+                        help=f"brownout voltage threshold (default {DEFAULT_BROWNOUT_VOLTS})")
+    parser.add_argument("--max", action="store_true", help="print max temp/voltage/current per device")
+    parser.add_argument("--full", action="store_true", help="print every reading")
+    parser.add_argument("--radio", action="store_true", help="print radio connection changes")
+    parser.add_argument("--filter", action="append", default=[], help="only entries containing this path (repeatable)")
+    parser.add_argument("--csv", metavar="FILE", help="export readings to a CSV file")
+    args = parser.parse_args(argv)
+
+    log_path = args.log or input("Drag your .wpilog file here and press Enter: ")
     log_path = log_path.strip().strip('"').strip("'")
     try:
         log = load_log(log_path)
     except (OSError, ValueError) as e:
         print(f"Error: {e}")
-        sys.exit(1)
-    interactive(log)
+        return 1
+
+    batch = args.brownouts or args.max or args.full or args.radio or args.csv
+    if not batch:
+        interactive(log)
+        return 0
+
+    if args.radio:
+        print_radio(log, args.filter)
+    if args.max:
+        print_max(log, args.filter)
+    if args.full:
+        print_full(log, args.filter)
+    if args.brownouts:
+        print_brownouts(log, args.threshold)
+    if args.csv:
+        export_csv(log, args.filter, args.csv)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
