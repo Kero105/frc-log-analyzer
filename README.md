@@ -53,6 +53,15 @@ A `.wpilog` file is a binary log. Every value the robot records is stored as a r
 3. sorts each entry into a category (temperature, voltage, current, radio) based on its name;
 4. scans the battery voltage for drops below the threshold and groups consecutive low readings into brownout events.
 
+## Tests
+
+The tests build small synthetic `.wpilog` files with known values, including a planned brownout, and check that the analyzer reports them correctly.
+
+```
+pip install pytest
+pytest
+```
+
 ## Credits
 
 `datalog.py` is the `.wpilog` reader from [WPILib](https://github.com/wpilibsuite/allwpilib). Copyright (c) FIRST and other WPILib contributors, and used under the WPILib BSD license. Everything else in this repo was written for Team 687.
