@@ -27,7 +27,7 @@ RADIO = "/Robot/RadioStatus/Connected"
 
 @pytest.fixture
 def match_log(tmp_path):
-    """A 5-second match with one brownout from t=2.0s to t=2.4s."""
+    """A 5-second match with one brownout from t=2.0s to t=2.4s (Systemcore levels)."""
     w = LogWriter()
     w.start(BATTERY, "double")
     w.start(SHOOTER_TEMP, "double")
@@ -38,7 +38,7 @@ def match_log(tmp_path):
 
     for i in range(51):  # every 0.1 s
         t = i * 0.1
-        volts = 6.2 if 2.0 <= t <= 2.35 else 12.1
+        volts = 6.1 if 2.0 <= t <= 2.35 else 12.1
         w.append(BATTERY, t, volts)
         w.append(SHOOTER_TEMP, t, 30.0 + t * 2)       # rises to 40 C
         w.append(SHOOTER_AMPS, t, 95.0 if 1.95 <= t <= 2.35 else 20.0)
@@ -88,7 +88,7 @@ def test_detects_one_brownout(match_log):
     event = events[0]
     assert event["start"] == pytest.approx(2.0)
     assert event["end"] == pytest.approx(2.4)
-    assert event["min_volts"] == pytest.approx(6.2)
+    assert event["min_volts"] == pytest.approx(6.1)
 
 
 def test_brownout_reports_motor_currents(match_log):
@@ -101,6 +101,54 @@ def test_brownout_reports_motor_currents(match_log):
 def test_threshold_is_adjustable(match_log):
     log = analyzer.load_log(match_log)
     assert analyzer.detect_brownouts(log, threshold=6.0) == []
+
+
+def battery_log(tmp_path, voltages):
+    """Battery voltage sampled every 0.1 s."""
+    w = LogWriter()
+    w.start(BATTERY, "double")
+    for i, v in enumerate(voltages):
+        w.append(BATTERY, i * 0.1, v)
+    path = tmp_path / "battery.wpilog"
+    w.save(path)
+    return analyzer.load_log(str(path))
+
+
+def test_brownout_lasts_until_restore_voltage(tmp_path):
+    # drops below 6.3 V at 0.1 s, recovers to 7.0 V (still below 7.5 V restore),
+    # and only turns back on when it passes 7.5 V at 0.4 s
+    log = battery_log(tmp_path, [12.0, 6.1, 7.0, 7.2, 8.0, 12.0])
+    events = analyzer.detect_brownouts(log)
+    assert len(events) == 1
+    assert events[0]["start"] == pytest.approx(0.1)
+    assert events[0]["end"] == pytest.approx(0.4)
+    assert events[0]["min_volts"] == pytest.approx(6.1)
+
+
+def test_dip_that_never_crosses_brownout_is_ignored(tmp_path):
+    log = battery_log(tmp_path, [12.0, 7.0, 6.5, 7.0, 12.0])
+    assert analyzer.detect_brownouts(log) == []
+
+
+def test_platform_thresholds(tmp_path):
+    # 6.5 V browns out a roboRIO 2 (6.75 V) but not Systemcore or roboRIO 1 (6.3 V)
+    log = battery_log(tmp_path, [12.0, 6.5, 12.0])
+    for platform, expected in [("systemcore", 0), ("roborio2", 1), ("roborio1", 0)]:
+        levels = analyzer.PLATFORMS[platform]
+        events = analyzer.detect_brownouts(log, levels["brownout"], levels["restore"])
+        assert len(events) == expected, platform
+
+
+def test_command_line_platform(tmp_path, capsys):
+    w = LogWriter()
+    w.start(BATTERY, "double")
+    for i, v in enumerate([12.0, 6.5, 12.0]):
+        w.append(BATTERY, i * 0.1, v)
+    path = tmp_path / "rio2.wpilog"
+    w.save(path)
+    analyzer.main([str(path), "--brownouts", "--platform", "roborio2"])
+    out = capsys.readouterr().out
+    assert "below 6.75V" in out and "Total: 1 brownout event(s)" in out
 
 
 def test_brownout_flag(tmp_path):
