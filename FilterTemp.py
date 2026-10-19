@@ -1,5 +1,5 @@
 # FRC Log Analyzer
-# Reads a .wpilog file from the roboRIO and reports motor temperatures,
+# Reads a .wpilog file from Systemcore (2027+) or the roboRIO and reports motor temperatures,
 # voltages, currents, radio status, and brownouts.
 #
 # Interactive mode (menus):
@@ -10,6 +10,7 @@
 #   python FilterTemp.py match.wpilog --brownouts
 #   python FilterTemp.py match.wpilog --max --filter /Robot/SuperSystem
 #   python FilterTemp.py match.wpilog --csv match_data.csv
+#   python FilterTemp.py old_match.wpilog --brownouts --platform roborio2
 #
 # On Windows you can also drag a .wpilog file onto Temp.bat.
 
@@ -21,8 +22,19 @@ from datalog import DataLogReader
 
 ALLOWED_PATHS = {"/Robot/RadioStatus", "/Robot/SuperSystem", "/Robot/SwerveDrive"}
 
-# The roboRIO 1 browns out at 6.8 V (the roboRIO 2 default is 6.75 V).
-DEFAULT_BROWNOUT_VOLTS = 6.8
+# Brownout behavior for each FRC controller. Outputs turn off when the battery
+# drops below "brownout" and stay off until it climbs back above "restore".
+#   Systemcore (2027+): 6.3 V / 7.5 V   (configurable; values may change)
+#   roboRIO 2:          6.75 V / 7.5 V  (6.75 V is the default; teams can change it)
+#   roboRIO 1:          6.3 V / 7.5 V   (fixed)
+PLATFORMS = {
+    "systemcore": {"brownout": 6.3, "restore": 7.5},
+    "roborio2": {"brownout": 6.75, "restore": 7.5},
+    "roborio1": {"brownout": 6.3, "restore": 7.5},
+}
+DEFAULT_PLATFORM = "systemcore"
+DEFAULT_BROWNOUT_VOLTS = PLATFORMS[DEFAULT_PLATFORM]["brownout"]
+DEFAULT_RESTORE_VOLTS = PLATFORMS[DEFAULT_PLATFORM]["restore"]
 
 
 # ---------- Reading the log (done once) ----------
@@ -204,12 +216,14 @@ def print_full(log, filters):
 
 # ---------- Brownout detection ----------
 
-def detect_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS):
+def detect_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS, restore=DEFAULT_RESTORE_VOLTS):
     """Find every stretch of time the robot browned out.
 
     Uses two sources:
-      1. Any boolean entry named like "BrownedOut" (logged by the roboRIO).
-      2. Battery voltage dropping below the threshold.
+      1. Any boolean entry named like "BrownedOut" (logged by the controller).
+      2. Battery voltage dropping below the threshold. The event lasts until
+         voltage climbs back above the restore level, because that is when
+         the controller turns the motors back on.
     For each event, also reports the highest motor currents at that moment,
     so you can see what was drawing power when the voltage dropped.
     """
@@ -219,7 +233,7 @@ def detect_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS):
         if is_brownout_flag(name):
             events.extend(_events_from_flag(name, readings))
         elif is_battery_voltage(name) and not is_current(name):
-            events.extend(_events_from_voltage(name, readings, threshold))
+            events.extend(_events_from_voltage(name, readings, threshold, restore))
 
     currents = {n: r for n, r in log.series.items() if is_current(n) and not is_skipped(n)}
     for event in events:
@@ -227,18 +241,19 @@ def detect_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS):
     return sorted(events, key=lambda e: e["start"])
 
 
-def _events_from_voltage(name, readings, threshold):
+def _events_from_voltage(name, readings, threshold, restore):
     events, current = [], None
     for timestamp_s, volts in sorted(readings):
-        if volts < threshold:
-            if current is None:
+        if current is None:
+            if volts < threshold:
                 current = {"source": name, "start": timestamp_s, "end": timestamp_s, "min_volts": volts}
-            current["end"] = timestamp_s
-            current["min_volts"] = min(current["min_volts"], volts)
-        elif current is not None:
-            current["end"] = timestamp_s
+        elif volts > restore:
+            current["end"] = timestamp_s          # motors turn back on here
             events.append(current)
             current = None
+        else:
+            current["end"] = timestamp_s          # still browned out
+            current["min_volts"] = min(current["min_volts"], volts)
     if current is not None:
         events.append(current)
     return events
@@ -271,14 +286,14 @@ def _top_currents(currents, start, end, count=3):
     return sorted(peaks, key=lambda p: p[1], reverse=True)[:count]
 
 
-def print_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS):
+def print_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS, restore=DEFAULT_RESTORE_VOLTS):
     battery = [n for n in log.series if is_battery_voltage(n) and log.series[n]]
     flags = [n for n in log.series if is_brownout_flag(n) and log.series[n]]
-    print(f"BROWNOUTS (threshold {threshold:.2f}V)")
+    print(f"BROWNOUTS (below {threshold:.2f}V, restored above {restore:.2f}V)")
     if not battery and not flags:
         print("  No battery voltage or brownout entries found in this log.")
         return
-    events = detect_brownouts(log, threshold)
+    events = detect_brownouts(log, threshold, restore)
     if not events:
         lowest = min((v for n in battery for _, v in log.series[n]), default=None)
         if lowest is not None:
@@ -338,7 +353,14 @@ def interactive(log):
         if raw == "q":
             break
         if raw == "b":
-            print_brownouts(log)
+            print("\nWhich controller recorded this log?")
+            print("  1  Systemcore (2027+)")
+            print("  2  roboRIO 2")
+            print("  3  roboRIO 1")
+            choice = input("\nEnter number (Enter = 1): ").strip()
+            platform = {"2": "roborio2", "3": "roborio1"}.get(choice, "systemcore")
+            levels = PLATFORMS[platform]
+            print_brownouts(log, levels["brownout"], levels["restore"])
             continue
 
         numbers = [int(s.strip()) for s in raw.split(",") if s.strip().isdigit()]
@@ -393,8 +415,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Analyze an FRC .wpilog file.")
     parser.add_argument("log", nargs="?", help="path to the .wpilog file")
     parser.add_argument("--brownouts", action="store_true", help="report brownout events")
-    parser.add_argument("--threshold", type=float, default=DEFAULT_BROWNOUT_VOLTS,
-                        help=f"brownout voltage threshold (default {DEFAULT_BROWNOUT_VOLTS})")
+    parser.add_argument("--platform", choices=sorted(PLATFORMS), default=DEFAULT_PLATFORM,
+                        help=f"controller the log came from (default {DEFAULT_PLATFORM})")
+    parser.add_argument("--threshold", type=float,
+                        help="custom brownout voltage (overrides --platform), e.g. if your code changed it")
     parser.add_argument("--max", action="store_true", help="print max temp/voltage/current per device")
     parser.add_argument("--full", action="store_true", help="print every reading")
     parser.add_argument("--radio", action="store_true", help="print radio connection changes")
@@ -422,7 +446,9 @@ def main(argv=None):
     if args.full:
         print_full(log, args.filter)
     if args.brownouts:
-        print_brownouts(log, args.threshold)
+        levels = PLATFORMS[args.platform]
+        threshold = args.threshold if args.threshold is not None else levels["brownout"]
+        print_brownouts(log, threshold, levels["restore"])
     if args.csv:
         export_csv(log, args.filter, args.csv)
     return 0
