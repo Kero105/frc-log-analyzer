@@ -1,252 +1,364 @@
-# Download Python 3 from python.org and make sure to check "Add Python to PATH" during installation.
-# Move the TempLogging folder to your desktop and open a terminal.
-# Run this script by enetering: "cd ~/Desktop/TempLogging" without the quotes into the terminal. 
-# Windows: Then run: "python FilterTemp.py" without the quotes.
-# Mac: Then run: "python3 FilterTemp.py" without the quotes.
-# Then drag your .wpilog file into the terminal and press enter.
+# FRC Log Analyzer
+# Reads a .wpilog file from the roboRIO and reports motor temperatures,
+# voltages, currents, radio status, and brownouts.
+#
+# Run: python FilterTemp.py   then drag your .wpilog file into the terminal.
+
+import sys
 
 from datalog import DataLogReader
 
-def get_top_level_paths(log_path):
+ALLOWED_PATHS = {"/Robot/RadioStatus", "/Robot/SuperSystem", "/Robot/SwerveDrive"}
+
+# The roboRIO 1 browns out at 6.8 V (the roboRIO 2 default is 6.75 V).
+DEFAULT_BROWNOUT_VOLTS = 6.8
+
+
+# ---------- Reading the log (done once) ----------
+
+class LogData:
+    """Everything we need from one .wpilog file, read in a single pass."""
+
+    def __init__(self):
+        self.names = []    # every entry name, in the order it appeared
+        self.series = {}   # entry name -> list of (timestamp_s, value)
+
+
+def load_log(log_path):
     with open(log_path, "rb") as f:
         reader = DataLogReader(f.read())
-    paths = set()
-    allowed = {"/Robot/RadioStatus", "/Robot/SuperSystem", "/Robot/SwerveDrive"}
+    if not reader:
+        raise ValueError(f"{log_path} is not a valid .wpilog file")
+
+    log = LogData()
+    entries = {}
     for record in reader:
         if record.isStart():
             data = record.getStartData()
-            if data.name.startswith("NT:"):
+            entries[data.entry] = (data.name, data.type)
+            log.names.append(data.name)
+            if data.type in ("double", "float", "int64", "boolean"):
+                log.series.setdefault(data.name, [])
+        elif not record.isControl():
+            if record.entry not in entries:
                 continue
-            if data.name.startswith("/DS") or data.name.startswith("DS"):
+            name, entry_type = entries[record.entry]
+            timestamp_s = record.timestamp / 1_000_000
+            try:
+                if entry_type == "double":
+                    value = record.getDouble()
+                elif entry_type == "float":
+                    value = record.getFloat()
+                elif entry_type == "int64":
+                    value = record.getInteger()
+                elif entry_type == "boolean":
+                    value = record.getBoolean()
+                else:
+                    continue
+            except TypeError as e:
+                print(f"  Could not read {name}: {e}")
                 continue
-            parts = data.name.strip("/").split("/")
-            if len(parts) >= 2:
-                path = "/" + "/".join(parts[:2])
-                if path in allowed:
-                    paths.add(path)
+            log.series[name].append((timestamp_s, value))
+    return log
+
+
+# ---------- Sorting entries into categories ----------
+
+def is_skipped(name):
+    return name.startswith("NT:") or name.startswith("/DS") or name.startswith("DS")
+
+
+def is_radio(name):
+    return "/Robot/RadioStatus" in name and "connected" in name.lower()
+
+
+def is_temp(name):
+    lower = name.lower()
+    return "temp" in lower or "celsius" in lower
+
+
+def is_current(name):
+    lower = name.lower()
+    return "current" in lower or "amps" in lower
+
+
+def is_voltage(name):
+    lower = name.lower()
+    return not is_current(name) and ("voltage" in lower or "volt" in lower
+                                     or "battery" in lower or "rail" in lower)
+
+
+def is_battery_voltage(name):
+    lower = name.lower()
+    return "battery" in lower and "volt" in lower
+
+
+def is_brownout_flag(name):
+    lower = name.lower()
+    return "brownout" in lower or "brownedout" in lower
+
+
+def device_of(name):
+    return name.rsplit("/", 1)[0]
+
+
+def get_top_level_paths(log):
+    paths = set()
+    for name in log.names:
+        if is_skipped(name):
+            continue
+        parts = name.strip("/").split("/")
+        if len(parts) >= 2:
+            path = "/" + "/".join(parts[:2])
+            if path in ALLOWED_PATHS:
+                paths.add(path)
     return sorted(paths)
 
-def get_subsystems(log_path):
-    with open(log_path, "rb") as f:
-        reader = DataLogReader(f.read())
+
+def get_subsystems(log):
     subsystems = set()
-    for record in reader:
-        if record.isStart():
-            data = record.getStartData()
-            if data.name.startswith("NT:"):
-                continue
-            if "/Robot/SuperSystem" not in data.name:
-                continue
-            parts = data.name.strip("/").split("/")
-            if len(parts) >= 3:
-                subsystems.add("/" + "/".join(parts[:3]))
+    for name in log.names:
+        if is_skipped(name) or "/Robot/SuperSystem" not in name:
+            continue
+        parts = name.strip("/").split("/")
+        if len(parts) >= 3:
+            subsystems.add("/" + "/".join(parts[:3]))
     return sorted(subsystems)
 
-def read_log(log_path, filters, show_max, show_full):
-    with open(log_path, "rb") as f:
-        reader = DataLogReader(f.read())
-    entries = {}
-    temp_entries = {}
-    voltage_entries = {}
-    bool_entries = {}
-    temp_data = {}
-    voltage_data = {}
-    bool_data = {}
 
-    for record in reader:
-        if record.isStart():
-            data = record.getStartData()
-            entries[data.entry] = {"name": data.name, "type": data.type}
-            name_lower = data.name.lower()
+def select(log, filters, test):
+    """Return {name: readings} for entries that pass the filter and the test."""
+    selected = {}
+    for name, readings in log.series.items():
+        if is_skipped(name) or not readings:
+            continue
+        if filters and not any(f in name for f in filters):
+            continue
+        if test(name):
+            selected[name] = readings
+    return selected
 
-            if data.name.startswith("NT:"):
-                continue
-            if data.name.startswith("/DS") or data.name.startswith("DS"):
-                continue
-            if filters and not any(f in data.name for f in filters):
-                continue
 
-            if "/Robot/RadioStatus" in data.name and "connected" in name_lower:
-                bool_entries[data.entry] = data.name
-                bool_data[data.name] = {}
-                continue
+# ---------- Reports ----------
 
-            if "temp" in name_lower or "temperature" in name_lower or "celsius" in name_lower:
-                temp_entries[data.entry] = data.name
-                temp_data[data.name] = {}
+def print_radio(log, filters):
+    radio = select(log, filters, is_radio)
+    if not radio:
+        return
+    print("RADIO STATUS")
+    for name, readings in radio.items():
+        for timestamp_s, value in readings:
+            print(f"  t={timestamp_s:.3f}s  {name} = {'Connected' if value else 'Disconnected'}")
 
-            if "voltage" in name_lower or "battery" in name_lower or "volt" in name_lower or "current" in name_lower or "rail" in name_lower:
-                voltage_entries[data.entry] = data.name
-                voltage_data[data.name] = {}
 
-        elif not record.isControl():
-            entry_id = record.entry
-            timestamp_s = record.timestamp / 1_000_000
-            entry_type = entries.get(entry_id, {}).get("type")
+def print_max(log, filters):
+    temps = select(log, filters, lambda n: is_temp(n) and not is_radio(n))
+    volts = select(log, filters, lambda n: is_voltage(n) and not is_radio(n))
+    amps = select(log, filters, lambda n: is_current(n) and not is_radio(n))
+    devices = sorted({device_of(n) for n in list(temps) + list(volts) + list(amps)})
+    if not devices:
+        return
+    print("MAX VALUES")
+    for device in devices:
+        parts = []
+        for label, group, unit in (("temp", temps, "°C"), ("voltage", volts, "V"), ("current", amps, "A")):
+            values = [v for n, r in group.items() if device_of(n) == device for _, v in r]
+            if values:
+                parts.append(f"max {label}: {max(values):.2f}{unit}")
+        print(f"  {device}  " + "  ".join(parts))
 
-            if entry_id in bool_entries:
-                name = bool_entries[entry_id]
-                try:
-                    value = record.getBoolean()
-                    bool_data[name][timestamp_s] = value
-                except Exception as e:
-                    print(f"  Could not read {name}: {e}")
 
-            if entry_id in temp_entries:
-                name = temp_entries[entry_id]
-                try:
-                    if entry_type == "double":
-                        value = record.getDouble()
-                    elif entry_type == "float":
-                        value = record.getFloat()
-                    else:
-                        continue
-                    temp_data[name][timestamp_s] = value
-                except Exception as e:
-                    print(f"  Could not read {name}: {e}")
+def print_full(log, filters):
+    temps = select(log, filters, lambda n: is_temp(n) and not is_radio(n))
+    volts = select(log, filters, lambda n: is_voltage(n) and not is_radio(n))
+    amps = select(log, filters, lambda n: is_current(n) and not is_radio(n))
+    devices = sorted({device_of(n) for n in list(temps) + list(volts) + list(amps)})
+    if not devices:
+        return
+    print("FULL DATA")
+    for device in devices:
+        print(f"\n{device}")
+        rows = {}
+        for label, group, unit in (("temp", temps, "°C"), ("voltage", volts, "V"), ("current", amps, "A")):
+            for name, readings in group.items():
+                if device_of(name) != device:
+                    continue
+                for timestamp_s, value in readings:
+                    rows.setdefault(timestamp_s, {})[label] = f"{label}: {value:.2f}{unit}"
+        for timestamp_s in sorted(rows):
+            cells = rows[timestamp_s]
+            text = "  ".join(cells[k] for k in ("temp", "voltage", "current") if k in cells)
+            print(f"  t={timestamp_s:.3f}s  {text}")
 
-            if entry_id in voltage_entries:
-                name = voltage_entries[entry_id]
-                try:
-                    if entry_type == "double":
-                        value = record.getDouble()
-                    elif entry_type == "float":
-                        value = record.getFloat()
-                    else:
-                        continue
-                    voltage_data[name][timestamp_s] = value
-                except Exception as e:
-                    print(f"  Could not read {name}: {e}")
 
-    all_devices = set()
-    for name in temp_data:
-        all_devices.add(name.rsplit("/", 1)[0])
-    for name in voltage_data:
-        all_devices.add(name.rsplit("/", 1)[0])
-    for name in bool_data:
-        all_devices.add(name.rsplit("/", 1)[0])
+# ---------- Brownout detection ----------
 
-    if any(name for name in bool_data):
-        print("RADIO STATUS")
-        for name, readings in bool_data.items():
-            for timestamp_s in sorted(readings):
-                value = readings[timestamp_s]
-                print(f"  t={timestamp_s:.3f}s  {name} = {'Connected' if value else 'Disconnected'}")
+def detect_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS):
+    """Find every stretch of time the robot browned out.
 
-    if show_max and (any(name for name in temp_data) or any(name for name in voltage_data)):
-        print("MAX VALUES")
-        for device in sorted(all_devices):
-            if any(n for n in bool_data if n.rsplit("/", 1)[0] == device):
-                continue
-            device_temps = {name: readings for name, readings in temp_data.items() if name.rsplit("/", 1)[0] == device}
-            device_volts = {name: readings for name, readings in voltage_data.items() if name.rsplit("/", 1)[0] == device}
-            all_temp_values = [v for readings in device_temps.values() for v in readings.values()]
-            all_volt_values = [v for readings in device_volts.values() for v in readings.values()]
-            if all_temp_values and all_volt_values:
-                print(f"  {device}  max temp: {max(all_temp_values):.2f}°C  max voltage: {max(all_volt_values):.2f}V")
-            elif all_temp_values:
-                print(f"  {device}  max temp: {max(all_temp_values):.2f}°C")
-            elif all_volt_values:
-                print(f"  {device}  max voltage: {max(all_volt_values):.2f}V")
+    Uses two sources:
+      1. Any boolean entry named like "BrownedOut" (logged by the roboRIO).
+      2. Battery voltage dropping below the threshold.
+    For each event, also reports the highest motor currents at that moment,
+    so you can see what was drawing power when the voltage dropped.
+    """
+    events = []
 
-    if show_full and (any(name for name in temp_data) or any(name for name in voltage_data)):
-        print("FULL DATA")
-        for device in sorted(all_devices):
-            if any(n for n in bool_data if n.rsplit("/", 1)[0] == device):
-                continue
-            print(f"\n{device}")
-            device_temps = {name: readings for name, readings in temp_data.items() if name.rsplit("/", 1)[0] == device}
-            device_volts = {name: readings for name, readings in voltage_data.items() if name.rsplit("/", 1)[0] == device}
-            all_timestamps = set()
-            for readings in device_temps.values():
-                all_timestamps.update(readings.keys())
-            for readings in device_volts.values():
-                all_timestamps.update(readings.keys())
-            for timestamp_s in sorted(all_timestamps):
-                temp_val = None
-                volt_val = None
-                for name, readings in device_temps.items():
-                    if timestamp_s in readings:
-                        temp_val = readings[timestamp_s]
-                for name, readings in device_volts.items():
-                    if timestamp_s in readings:
-                        volt_val = readings[timestamp_s]
-                if temp_val is not None and volt_val is not None:
-                    print(f"  t={timestamp_s:.3f}s  temp: {temp_val:.2f}°C  voltage: {volt_val:.2f}V")
-                elif temp_val is not None:
-                    print(f"  t={timestamp_s:.3f}s  temp: {temp_val:.2f}°C")
-                elif volt_val is not None:
-                    print(f"  t={timestamp_s:.3f}s  voltage: {volt_val:.2f}V")
+    for name, readings in log.series.items():
+        if is_brownout_flag(name):
+            events.extend(_events_from_flag(name, readings))
+        elif is_battery_voltage(name) and not is_current(name):
+            events.extend(_events_from_voltage(name, readings, threshold))
 
-if __name__ == "__main__":
-    log_path = input("Drag your .wpilog file here and press Enter: ")
-    log_path = log_path.strip().strip('"')
+    currents = {n: r for n, r in log.series.items() if is_current(n) and not is_skipped(n)}
+    for event in events:
+        event["top_currents"] = _top_currents(currents, event["start"], event["end"])
+    return sorted(events, key=lambda e: e["start"])
 
-    paths = get_top_level_paths(log_path)
-    subsystems = get_subsystems(log_path)
+
+def _events_from_voltage(name, readings, threshold):
+    events, current = [], None
+    for timestamp_s, volts in sorted(readings):
+        if volts < threshold:
+            if current is None:
+                current = {"source": name, "start": timestamp_s, "end": timestamp_s, "min_volts": volts}
+            current["end"] = timestamp_s
+            current["min_volts"] = min(current["min_volts"], volts)
+        elif current is not None:
+            current["end"] = timestamp_s
+            events.append(current)
+            current = None
+    if current is not None:
+        events.append(current)
+    return events
+
+
+def _events_from_flag(name, readings):
+    events, start = [], None
+    for timestamp_s, value in sorted(readings):
+        if value and start is None:
+            start = timestamp_s
+        elif not value and start is not None:
+            events.append({"source": name, "start": start, "end": timestamp_s, "min_volts": None})
+            start = None
+    if start is not None:
+        last = max(t for t, _ in readings)
+        events.append({"source": name, "start": start, "end": last, "min_volts": None})
+    return events
+
+
+def _top_currents(currents, start, end, count=3):
+    """Highest current per channel during [start, end], or the last reading before it."""
+    peaks = []
+    for name, readings in currents.items():
+        during = [v for t, v in readings if start <= t <= end]
+        if not during:
+            before = [v for t, v in readings if t <= start]
+            during = before[-1:]
+        if during:
+            peaks.append((name, max(during)))
+    return sorted(peaks, key=lambda p: p[1], reverse=True)[:count]
+
+
+def print_brownouts(log, threshold=DEFAULT_BROWNOUT_VOLTS):
+    battery = [n for n in log.series if is_battery_voltage(n) and log.series[n]]
+    flags = [n for n in log.series if is_brownout_flag(n) and log.series[n]]
+    print(f"BROWNOUTS (threshold {threshold:.2f}V)")
+    if not battery and not flags:
+        print("  No battery voltage or brownout entries found in this log.")
+        return
+    events = detect_brownouts(log, threshold)
+    if not events:
+        lowest = min((v for n in battery for _, v in log.series[n]), default=None)
+        if lowest is not None:
+            print(f"  None. Lowest battery voltage: {lowest:.2f}V")
+        else:
+            print("  None.")
+        return
+    for i, event in enumerate(events, 1):
+        length = event["end"] - event["start"]
+        volts = f"  min {event['min_volts']:.2f}V" if event["min_volts"] is not None else ""
+        print(f"  #{i}  t={event['start']:.3f}s to {event['end']:.3f}s ({length:.3f}s){volts}  [{event['source']}]")
+        for name, amps in event["top_currents"]:
+            print(f"        {name}: {amps:.1f}A")
+    print(f"  Total: {len(events)} brownout event(s)")
+
+
+# ---------- Interactive menus ----------
+
+def interactive(log):
+    paths = get_top_level_paths(log)
+    subsystems = get_subsystems(log)
 
     while True:
         print("\nAvailable filters:")
         print("  0  No filter (show everything)")
         for i, path in enumerate(paths, 1):
             print(f"  {i}  {path}")
+        print("  b  Brownout report")
         print("  q  Quit")
 
-        raw = input("\nEnter numbers separated by commas: ")
-        if raw.strip().lower() == "q":
+        raw = input("\nEnter numbers separated by commas: ").strip().lower()
+        if raw == "q":
             break
+        if raw == "b":
+            print_brownouts(log)
+            continue
 
-        selected = [s.strip() for s in raw.split(",") if s.strip().isdigit()]
-        numbers = [int(s) for s in selected]
-
+        numbers = [int(s.strip()) for s in raw.split(",") if s.strip().isdigit()]
         if 0 in numbers or not numbers:
             filters = []
         else:
             filters = [paths[n - 1] for n in numbers if 1 <= n <= len(paths)]
 
         is_supersystem = any("/Robot/SuperSystem" in f for f in filters) or not filters
-        is_radio = all("/Robot/RadioStatus" in f for f in filters) if filters else False
+        radio_only = all("/Robot/RadioStatus" in f for f in filters) if filters else False
 
-        if not is_radio:
-            while True:
-                print("\nWhat do you want to see?")
-                print("  1  Max values only")
-                print("  2  Full data only")
-                print("  3  Both")
+        if radio_only:
+            print_radio(log, filters)
+            continue
+
+        while True:
+            print("\nWhat do you want to see?")
+            print("  1  Max values only")
+            print("  2  Full data only")
+            print("  3  Both")
+            print("  b  Back")
+            view_choice = input("\nEnter number: ").strip().lower()
+            if view_choice == "b":
+                break
+            if view_choice not in ("1", "2", "3"):
+                continue
+
+            final_filters = list(filters)
+            if is_supersystem:
+                print("\nSubsystem filter:")
+                print("  0  All subsystems")
+                for i, sub in enumerate(subsystems, 1):
+                    print(f"  {i}  {sub}")
                 print("  b  Back")
-                view_choice = input("\nEnter number: ").strip().lower()
-
-                if view_choice == "b":
-                    break
-
-                if view_choice not in ("1", "2", "3"):
+                sub_raw = input("\nEnter number: ").strip().lower()
+                if sub_raw == "b":
                     continue
+                if sub_raw.isdigit() and 1 <= int(sub_raw) <= len(subsystems):
+                    final_filters = [subsystems[int(sub_raw) - 1]]
 
-                show_max = view_choice in ("1", "3")
-                show_full = view_choice in ("2", "3")
+            print_radio(log, final_filters)
+            if view_choice in ("1", "3"):
+                print_max(log, final_filters)
+            if view_choice in ("2", "3"):
+                print_full(log, final_filters)
+            break
 
-                if is_supersystem:
-                    while True:
-                        print("\nSubsystem filter:")
-                        print("  0  All subsystems")
-                        for i, sub in enumerate(subsystems, 1):
-                            print(f"  {i}  {sub}")
-                        print("  b  Back")
-                        sub_raw = input("\nEnter number: ").strip().lower()
 
-                        if sub_raw == "b":
-                            break
+# ---------- Entry point ----------
 
-                        final_filters = list(filters)
-                        if sub_raw.isdigit() and int(sub_raw) != 0:
-                            idx = int(sub_raw)
-                            if 1 <= idx <= len(subsystems):
-                                final_filters = [subsystems[idx - 1]]
-
-                        read_log(log_path, final_filters, show_max, show_full)
-                        break
-                else:
-                    read_log(log_path, filters, show_max, show_full)
-                    break
-        else:
-            read_log(log_path, filters, False, False)
+if __name__ == "__main__":
+    log_path = input("Drag your .wpilog file here and press Enter: ")
+    log_path = log_path.strip().strip('"').strip("'")
+    try:
+        log = load_log(log_path)
+    except (OSError, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    interactive(log)
