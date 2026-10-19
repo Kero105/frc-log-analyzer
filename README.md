@@ -8,6 +8,7 @@ A Python tool for FRC teams that reads `.wpilog` match logs from the roboRIO and
 - **Max values.** It reports the peak temperature, voltage and current for each subsystem.
 - **Full data.** It prints every reading, sorted by timestamp.
 - **Radio status.** It shows each time the robot radio connected or disconnected.
+- **CSV export.** It saves readings to a spreadsheet so you can graph them.
 - **Filters.** You can narrow the output to `/Robot/SuperSystem`, `/Robot/SwerveDrive`, `/Robot/RadioStatus` or a single subsystem.
 
 ## Setup
@@ -17,11 +18,31 @@ A Python tool for FRC teams that reads `.wpilog` match logs from the roboRIO and
 
 ## Usage
 
+**Interactive mode (menus):**
+
 ```
-python FilterTemp.py
+python FilterTemp.py match.wpilog
 ```
 
-Drag your `.wpilog` file into the terminal and press Enter. Choose `b` to get a brownout report, or pick filters to see max values and full data.
+On Windows you can also drag a `.wpilog` file onto `Temp.bat`.
+
+**Command-line mode:**
+
+```
+python FilterTemp.py match.wpilog --brownouts
+python FilterTemp.py match.wpilog --max --filter /Robot/SuperSystem
+python FilterTemp.py match.wpilog --brownouts --threshold 6.75
+python FilterTemp.py match.wpilog --csv match_data.csv
+```
+
+Example brownout report:
+
+```
+BROWNOUTS (threshold 6.80V)
+  #1  t=1.000s to 1.200s (0.200s)  min 6.40V  [/Robot/SuperSystem/PowerDistribution/BatteryVoltage]
+        /Robot/SuperSystem/Shooter/MotorCurrent: 90.0A
+  Total: 1 brownout event(s)
+```
 
 ## How it works
 
